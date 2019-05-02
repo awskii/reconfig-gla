@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"sync"
 	"sync/atomic"
 )
 
@@ -36,7 +35,7 @@ const (
 
 // Lattice should be initalized in every working process
 type Lattice struct {
-	accounts map[uint64]*Element // by account ID store their ordered by SeqID transactions.
+	accounts map[uint64]*Element // by account ID store their ordered by SendSeqID transactions.
 	version  uint64              // why it should not be proposerSeqNo?
 }
 
@@ -51,17 +50,11 @@ type Element struct {
 
 // Tx represents transaction
 type Tx struct {
-	Sender   uint64 // sender account ID
-	Reciever uint64 // reciever account ID
-	Amount   uint64 // tx amount
-	SeqID    uint64 // tx sequence number
-}
-
-// Neighbours is a struct to separate all networking and
-// communication stuff from process structure
-type Neighbours struct {
-	hosts map[uint64]net.Conn
-	// TODO(awskii): Quorums [][]
+	Sender    uint64 // sender account ID
+	Reciever  uint64 // reciever account ID
+	Amount    uint64 // tx amount
+	SendSeqID uint64 // tx sequence number for Sender account
+	RecvSeqID uint64 // tx sequence number for Receiver account
 }
 
 // Message is an interface for anything which could be
@@ -70,48 +63,6 @@ type Message interface {
 	Bytes() []byte
 	RespondToAddr() net.Addr
 	// TODO(awskii): should be extended with crypto signatures
-}
-
-// bcast does broadcast on all known hosts and collects delivery error.
-// Any error during connection writing treated as delivery error.
-//
-// TODO(awskii): seems like RPC is suits to problem far more than simple TCP keep-alive.
-func (n *Neighbours) bcast(msg []byte) map[uint64]error {
-	hostsReceivedMutex := new(sync.Mutex)
-	hostsReceived := make(map[uint64]error)
-
-	for k, v := range n.hosts {
-		go func(host uint64, c net.Conn, mu *sync.Mutex) {
-			b, err := c.Write(msg)
-			if b != len(msg) {
-				err = fmt.Errorf("host=0x%x received bytes=%d msg_bytes=%d", host, b, len(msg))
-			}
-			mu.Lock()
-			hostsReceived[host] = err
-			mu.Unlock()
-		}(k, v, hostsReceivedMutex)
-	}
-	return hostsReceived
-}
-
-func (n *Neighbours) send(hostID uint64, msg []byte) error {
-	host, ok := n.hosts[hostID]
-	if !ok {
-		return fmt.Errorf("host with id=%d not in active host list", hostID)
-	}
-	b, err := host.Write(msg)
-	if err != nil {
-		return err
-	}
-	if b != len(msg) {
-		return fmt.Errorf("host sent bytes mismatch: msg_size=%d write_size=%d", len(msg), b)
-	}
-	return nil
-}
-
-// N returns amount of currently active servers
-func (n *Neighbours) N() uint64 {
-	return uint64(len(n.hosts))
 }
 
 // Process holds all needed data and states
@@ -197,9 +148,9 @@ func dist(prev, next *Element) (int, error) {
 	}
 
 	latestPrev, latestNext := prev.T[len(prev.T)-1], next.T[len(next.T)-1]
-	d := latestNext.SeqID - latestPrev.SeqID
+	d := latestNext.SendSeqID - latestPrev.SendSeqID
 	if d == 0 {
-		panic(fmt.Errorf("ordering violation at seq_no=%d", latestNext.SeqID))
+		panic(fmt.Errorf("ordering violation at seq_no=%d", latestNext.SendSeqID))
 	}
 	if err != nil {
 		return int(d), err
@@ -268,16 +219,19 @@ func validate(accoountID uint64, prev, next *Element) error {
 
 func compare(a, b *Tx) error {
 	if a.Sender != b.Sender {
-		return fmt.Errorf("their tx seq_no=%d: invalid Sender", b.SeqID)
+		return fmt.Errorf("their tx seq_no<%d->%d>: invalid Sender", b.SendSeqID, b.RecvSeqID)
 	}
 	if a.Reciever != b.Reciever {
-		return fmt.Errorf("their tx seq_no=%d: invalid Receiver", b.SeqID)
+		return fmt.Errorf("their tx seq_no<%d->%d>: invalid Receiver", b.SendSeqID, b.RecvSeqID)
 	}
 	if a.Amount != b.Amount {
-		return fmt.Errorf("their tx seq_no=%d: invalid Amount", b.SeqID)
+		return fmt.Errorf("their tx seq_no<%d->%d>: invalid Amount", b.SendSeqID, b.RecvSeqID)
 	}
-	if a.SeqID != b.SeqID {
-		return fmt.Errorf("their tx seq_no=%d: invalid Amount", b.SeqID)
+	if a.SendSeqID != b.SendSeqID {
+		return fmt.Errorf("their tx seq_no<%d->%d>: invalid SendSeqID", b.SendSeqID, b.RecvSeqID)
+	}
+	if a.RecvSeqID != b.RecvSeqID {
+		return fmt.Errorf("their tx seq_no<%d->%d>: invalid RecvSeqID", b.SendSeqID, b.SendSeqID)
 	}
 	return nil
 }
@@ -302,7 +256,7 @@ func refine(prev, next *Element) (*Element, error) {
 		T: make([]Tx, dist),
 	}
 
-	for i, j := 0, next.T[len(next.T)-1].SeqID; j < uint64(len(prev.T)); i, j = i+1, j+1 {
+	for i, j := 0, next.T[len(next.T)-1].SendSeqID; j < uint64(len(prev.T)); i, j = i+1, j+1 {
 		diff.T[i] = prev.T[j]
 	}
 	return diff, nil
@@ -329,7 +283,7 @@ func (p *Process) Propose(accountID uint64) {
 		ProcAddr:  p.listener.Addr(),
 	}
 
-	responses := p.Neighbours.bcast(prop.Bytes())
+	responses := p.Neighbours.Bcast(prop)
 	for _, err := range responses {
 	}
 	atomic.StoreUint32(&p.status, StatusProposer)
@@ -370,6 +324,10 @@ func (r *responseMessage) Bytes() []byte {
 		panic(err)
 	}
 	return buf.Bytes()
+}
+
+func (r *responseMessage) RespondToAddr() net.Addr {
+	return nil
 }
 
 type proposal struct {
@@ -415,14 +373,14 @@ func (p *Process) Decide(proposerID, proposalSeqNo uint64, proposedValue *Elemen
 	if err := validate(p.OwnedAccount, p.acceptedValue, proposedValue); err != nil {
 		p.acceptedValue, err = merge(p.OwnedAccount, p.acceptedValue, p.proposedValue)
 		msg.Value = *p.acceptedValue
-		if err := p.Neighbours.send(proposerID, msg.Bytes()); err != nil {
+		if err := p.Neighbours.Send(proposerID, msg); err != nil {
 			panic(err)
 		}
 		return false
 	}
 	p.acceptedValue = p.proposedValue
 	msg.Ack = true
-	err := p.Neighbours.send(proposerID, msg.Bytes())
+	err := p.Neighbours.Send(proposerID, msg)
 	if err != nil {
 		panic(err)
 	}
