@@ -1,17 +1,20 @@
 package lattice
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 )
 
-// Neighbours interface needed to separate Lattice model from Broadcast
+// neighbours interface needed to separate Lattice model from Broadcast
 // mechanism which Lattice can employ.
 type Neighbours interface {
 	N() uint64                          // amount of active neighbours
-	Bcast(msg Message) map[uint64]error // map where k:v is account_id:transmission_error if occured
-	Send(receiverPID uint64, msg Message) error
+	// Bcast(msg Message) map[uint64]error // map where k:v is account_id:transmission_error if occured
+	Bcast(ctx context.Context, msg Message) <-chan Message
+	Send(receiverPID uint64, msg Message) (<-chan Message, error)
 }
 
 // Neigh is a struct to separate all networking and
@@ -61,4 +64,83 @@ func (n *Neigh) Send(hostID uint64, msg []byte) error {
 // N returns amount of currently active servers
 func (n *Neigh) N() uint64 {
 	return uint64(len(n.hosts))
+}
+
+// local is a Neighbours impl for use message passing at one host
+type local struct {
+	mu  sync.RWMutex
+	hosts map[uint64]duplex
+}
+
+type duplex struct {
+	in chan<- Message
+	out <-chan Message
+}
+
+func (l *local) AddNew(hostID uint64) {
+	l.mu.Lock()
+	l.hosts[hostID] = duplex{in: make(chan <- Message, 1), out: make(<-chan Message, 1)}
+	l.mu.Unlock()
+}
+
+func (l *local) N() uint64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return uint64(len(l.hosts))
+}
+
+func (l *local) Send(hid uint64, msg Message) (<-chan Message, error) {
+	l.mu.RLock()
+	ch := l.hosts[hid]
+	l.mu.RUnlock()
+
+	if ch.in == nil || ch.out == nil{
+		return nil, errors.New("route to host is malformed")
+	}
+	ch.in<-msg
+	return ch.out, nil // leaking channel, but should not be a problem
+}
+
+func (l *local) Bcast(ctx context.Context, msg Message) <-chan Message {
+	sink := make(chan Message)
+	var wg sync.WaitGroup
+
+	l.mu.RLock()
+	for _, ch := range l.hosts {
+		ch.in <-msg
+		wg.Add(1)
+
+		// routine waits response from process. Any response from process copied
+		// to sink from which Sender can read responses. Waiting can be interrupted by context
+		go func(sink chan<- Message, out <-chan Message, ctx context.Context, wg *sync.WaitGroup) {
+			defer wg.Done()
+			select {
+			case m := <-out:
+				sink <- m
+			case <-ctx.Done():
+				return
+			}
+		}(sink, ch.out, ctx, &wg)
+	}
+	l.mu.RUnlock()
+
+	// routine needed for proper closing of a sink. It closes if all hosts did respond OR if
+	// ctx has been cancelled, whatever happens first.
+	go func(sink chan<- Message, ctx context.Context, wg *sync.WaitGroup) {
+		ch := make(chan struct{}, 1)
+		go func() {
+			wg.Wait()
+			ch <- struct{}{}
+		}()
+
+		select  {
+		case <-ctx.Done():
+			break
+		case <-ch:
+			break
+		}
+		close(sink)
+	}(sink, ctx, &wg)
+
+	return sink
 }
