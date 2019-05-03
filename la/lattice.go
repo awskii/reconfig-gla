@@ -1,10 +1,13 @@
-package lattice
+package la
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 )
 
 var (
@@ -49,6 +52,20 @@ type Lattice struct {
 	ownedAccount uint64
 }
 
+func NewLattice(owner uint64) *Lattice {
+	return &Lattice{
+		accounts:make(map[uint64]*Element),
+		ownedAccount:owner,
+	}
+}
+
+func (l *Lattice) AddAccount(aid uint64) {
+	l.accounts[aid] = &Element{
+		accountID: aid,
+		T: make([]Tx, 0),
+	}
+}
+
 // Element reprsents one lattice element
 type Element struct {
 	accountID uint64 // defines owner of a set T
@@ -82,9 +99,39 @@ type Process struct {
 	status     uint32     // current process status {Proposer, Acceptor}
 	lattice    *Lattice   // Lattice structure for, implementation of a GLA
 	neighbours Neighbours // map of available servers to P2P communication with
+	log *zap.Logger
 	// CurrentQuorumID int -- should be added later. All quorum stuff should be
 	// moved into separated module about Network: P2P state, known active host list,
 	// list of quorums in currently active configuration and other.
+}
+
+func NewProcess(id uint64, l *Lattice, n Neighbours, log *zap.Logger) *Process {
+	log = log.With(zap.Uint64("PID", id), zap.Uint64("owned_account_id", l.ownedAccount))
+	log.Info("process initiated", )
+
+	return &Process{
+		id: id,
+		lattice : l,
+		neighbours : n,
+		log:log,
+	}
+}
+
+func (p *Process) Operate() error {
+	for msg := range p.neighbours.Recv() {
+		switch msg.(type) {
+		case *proposal:
+			m, _ := msg.(*proposal)
+		default:
+
+
+
+		}
+		m, ok := msg.(*proposal)
+		if !ok {
+			continue
+		}
+	}
 }
 
 // Merge used to merge element e with sub-semi-lattice of an
@@ -148,61 +195,84 @@ func (p *Process) Propose(ownedAccountID uint64, tx *Tx) error {
 	defer atomic.StoreUint32(&p.status, StatusProposer)
 
 	// TODO(awskii): process should own that account and quorum should approve it
+	// TODO(awskii): when proposal become more useful, move broadcast into lattice Propose function
 	prop, err := p.lattice.makeProposal(p.id, tx)
 	if err != nil {
 		return err
 	}
 	// thats only delivery reports, not ACK/NACK messages
-	deliveryReport := p.neighbours.Bcast(prop)
+	resp := p.neighbours.Bcast(context.Background(), prop)
+	for r := range resp {
+		rm, ok := r.(*responseMessage)
+		if !ok || rm.SeqNo != prop.SeqNo {
+			continue
+		}
 
+		if rm.Ack {
+			// we could count ack/nack in proposal to get more elegant solution
+			p.lattice.ack++
+		} else {
+			p.lattice.nack++
+		}
+		// condition could turns into true before we process all response
+		if p.predicate(ownedAccountID, p.neighbours.N(), p.lattice.ack, p.lattice.nack) {
+			// true here means quorum accepted that change, apply it to our version
+			p.lattice.Merge(ownedAccountID, prop.Value)
+		}
+	}
 	return err
 }
 
 // simple func to easily check if some 'predicate' holds on proposal
-func (p *Process) predicate(accountID uint64, proposedValue *Element, N, ack, nack uint64) bool {
+func (p *Process) predicate(accountID uint64, N, ack, nack uint64) bool {
 	if nack > 0 && nack+ack >= quorum(N, ack, nack) && atomic.LoadUint32(&p.status) == StatusProposer {
 		return false
 	}
-	if ack < quorum(N, ack, nack) && atomic.LoadUint32(&p.status) != StatusProposer {
+	if ack < quorum(N, ack, nack) && atomic.LoadUint32(&p.status) == StatusProposer {
 		return false
 	}
 	return true
 }
 
-// Decide is an Accept func from original GLA
-func (p *Process) Decide(proposerID, proposalSeqNo uint64, proposedValue *Element) bool {
+func (p *Process) Decide(proposerID uint64, proposal *proposal) bool {
 	if atomic.LoadUint32(&p.status) != StatusAcceptor {
 		panic("Decide call with non-acceptor process status")
 		// return false
 	}
-	if proposalSeqNo != p.proposalSeqNo {
+	return p.lattice.Decide(proposerID, p.id, proposal, p.neighbours)
+}
+
+// Decide is an Accept func from original GLA
+func (l *Lattice) Decide(proposerID, myPID uint64, proposal *proposal, netw Neighbours) bool {
+	if proposal.SeqNo != l.proposalSeqNo {
 		panic(fmt.Errorf(
 			"deciding on proposal_seq_no=%d, proccess current proposal_seq_no=%d",
-			proposalSeqNo, p.proposalSeqNo))
+			proposal.SeqNo, l.proposalSeqNo))
 		// return false
 	}
 
 	// TODO need to check if we processing currently proposed value
 	msg := &responseMessage{
-		PID:   p.id,
-		SeqNo: proposalSeqNo,
-		Value: *proposedValue,
+		PID:   myPID,
+		SeqNo: proposal.SeqNo,
+		Value: proposal.Value,
 	}
 
-	if err := validate(p.ownedAccount, p.acceptedValue, proposedValue); err != nil {
-		p.acceptedValue, err = merge(p.ownedAccount, p.acceptedValue, p.proposedValue)
-		msg.Value = *p.acceptedValue
-		if err := p.neighbours.Send(proposerID, msg); err != nil {
-			panic(err)
-		}
+	if err := validate(l.ownedAccount, l.acceptedValue, &proposal.Value); err != nil {
+		l.acceptedValue, err = merge(l.ownedAccount, l.acceptedValue, &proposal.Value)
+		msg.Value = *l.acceptedValue
+		netw.Bcast(context.Background(), msg)
+		// for resp := range netw.Bcast(context.Background(), msg) {
+		// 	r, ok := resp.(*responseMessage)
+		// 	if !ok {
+		// 		continue
+		// 	}
+		// }
 		return false
 	}
-	p.acceptedValue = p.proposedValue
+	l.acceptedValue = l.proposedValue
 	msg.Ack = true
-	err := p.neighbours.Send(proposerID, msg)
-	if err != nil {
-		panic(err)
-	}
+	netw.Bcast(context.Background(), msg)
 	return true
 }
 

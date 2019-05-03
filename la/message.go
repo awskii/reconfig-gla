@@ -1,4 +1,4 @@
-package lattice
+package la
 
 import (
 	"bytes"
@@ -45,3 +45,30 @@ func (p *proposal) Bytes() []byte {
 func (p *proposal) RespondToAddr() net.Addr {
 	return p.ProcAddr
 }
+
+type DiffType int
+
+const (
+	txDiff DiffType = 1 << iota
+)
+
+type Diff interface {
+	Type() DiffType
+}
+
+type Proposal struct {
+	ProposerID       uint64
+	ack, nack, seqNo uint64
+
+	Value Diff
+}
+
+func (p *Proposal) Bytes() []byte {
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+	if err := enc.Encode(p); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+

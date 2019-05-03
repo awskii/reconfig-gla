@@ -1,4 +1,4 @@
-package lattice
+package la
 
 import (
 	"context"
@@ -12,9 +12,9 @@ import (
 // mechanism which Lattice can employ.
 type Neighbours interface {
 	N() uint64                          // amount of active neighbours
-	// Bcast(msg Message) map[uint64]error // map where k:v is account_id:transmission_error if occured
 	Bcast(ctx context.Context, msg Message) <-chan Message
 	Send(receiverPID uint64, msg Message) (<-chan Message, error)
+	Recv() <-chan Message
 }
 
 // Neigh is a struct to separate all networking and
@@ -66,10 +66,16 @@ func (n *Neigh) N() uint64 {
 	return uint64(len(n.hosts))
 }
 
-// local is a Neighbours impl for use message passing at one host
-type local struct {
+// Local is a Neighbours impl for use message passing at one host
+type Local struct {
 	mu  sync.RWMutex
 	hosts map[uint64]duplex
+}
+
+func NewNeighboursLocal() *Local {
+	return &Local{
+		hosts: make(map[uint64]duplex),
+	}
 }
 
 type duplex struct {
@@ -77,19 +83,19 @@ type duplex struct {
 	out <-chan Message
 }
 
-func (l *local) AddNew(hostID uint64) {
+func (l *Local) AddNew(hostID uint64) {
 	l.mu.Lock()
 	l.hosts[hostID] = duplex{in: make(chan <- Message, 1), out: make(<-chan Message, 1)}
 	l.mu.Unlock()
 }
 
-func (l *local) N() uint64 {
+func (l *Local) N() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return uint64(len(l.hosts))
 }
 
-func (l *local) Send(hid uint64, msg Message) (<-chan Message, error) {
+func (l *Local) Send(hid uint64, msg Message) (<-chan Message, error) {
 	l.mu.RLock()
 	ch := l.hosts[hid]
 	l.mu.RUnlock()
@@ -101,7 +107,7 @@ func (l *local) Send(hid uint64, msg Message) (<-chan Message, error) {
 	return ch.out, nil // leaking channel, but should not be a problem
 }
 
-func (l *local) Bcast(ctx context.Context, msg Message) <-chan Message {
+func (l *Local) Bcast(ctx context.Context, msg Message) <-chan Message {
 	sink := make(chan Message)
 	var wg sync.WaitGroup
 
