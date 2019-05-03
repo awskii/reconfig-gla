@@ -2,11 +2,11 @@ package la
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
 
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -259,21 +259,24 @@ func (l *Lattice) Decide(proposerID, myPID uint64, proposal *proposal, netw Neig
 	}
 
 	if err := validate(l.ownedAccount, l.acceptedValue, &proposal.Value); err != nil {
-		l.acceptedValue, err = merge(l.ownedAccount, l.acceptedValue, &proposal.Value)
+		av, e :=  refine(l.acceptedValue, &proposal.Value)
+		if e != nil {
+			/* can't merge accepted and proposed value
+			When we can't do it?
+			 */
+			msg.Value = *l.acceptedValue
+			netw.Bcast(context.Background(), msg)
+			 return false, errors.Errorf("refine_err=%v validation_err=%v", e, err)
+		}
+		l.acceptedValue = av
 		msg.Value = *l.acceptedValue
 		netw.Bcast(context.Background(), msg)
-		// for resp := range netw.Bcast(context.Background(), msg) {
-		// 	r, ok := resp.(*responseMessage)
-		// 	if !ok {
-		// 		continue
-		// 	}
-		// }
-		return false
+		return false, errors.Wrap(err, "validation failure")
 	}
 	l.acceptedValue = l.proposedValue
 	msg.Ack = true
 	netw.Bcast(context.Background(), msg)
-	return true
+	return true, nil
 }
 
 // ------------------------- Helper functions -----------------------------
