@@ -14,7 +14,7 @@ type Neighbours interface {
 	N() uint64                          // amount of active neighbours
 	Bcast(ctx context.Context, msg Message) <-chan Message
 	Send(receiverPID uint64, msg Message) (<-chan Message, error)
-	Recv() <-chan Message
+	Recv(host uint64) <-chan Message
 }
 
 // Neigh is a struct to separate all networking and
@@ -150,3 +150,14 @@ func (l *Local) Bcast(ctx context.Context, msg Message) <-chan Message {
 
 	return sink
 }
+
+
+// ofc only owner process should receive from channel. But in case of Local impl
+func (l *Local) Recv(host uint64) <-chan Message {
+	var c <-chan Message
+	l.mu.RLock()
+	c  = l.hosts[host].out
+	l.mu.RUnlock()
+	return c
+}
+

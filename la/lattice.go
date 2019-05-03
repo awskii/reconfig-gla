@@ -29,7 +29,7 @@ const (
 	// requests from network, but can not propose new values
 	StatusAcceptor uint32 = 0
 	// StatusProposer means that process proposing new value now
-	// and can't handle Decide calls from other processes
+	// and can't handle Accept calls from other processes
 	StatusProposer uint32 = 1
 )
 
@@ -106,7 +106,7 @@ type Process struct {
 }
 
 func NewProcess(id uint64, l *Lattice, n Neighbours, log *zap.Logger) *Process {
-	log = log.With(zap.Uint64("PID", id), zap.Uint64("owned_account_id", l.ownedAccount))
+	log = log.With(zap.Uint64("pid", id), zap.Uint64("owned_account_id", l.ownedAccount))
 	log.Info("process initiated", )
 
 	return &Process{
@@ -118,20 +118,16 @@ func NewProcess(id uint64, l *Lattice, n Neighbours, log *zap.Logger) *Process {
 }
 
 func (p *Process) Operate() error {
-	for msg := range p.neighbours.Recv() {
+	for msg := range p.neighbours.Recv(p.id) {
 		switch msg.(type) {
 		case *proposal:
 			m, _ := msg.(*proposal)
+			p.Accept(m.SenderPID, m)
 		default:
-
-
-
-		}
-		m, ok := msg.(*proposal)
-		if !ok {
-			continue
+			p.log.Debug("received msg of unknown type", zap.Binary("packet", msg.Bytes()))
 		}
 	}
+	return nil
 }
 
 // Merge used to merge element e with sub-semi-lattice of an
@@ -200,7 +196,7 @@ func (p *Process) Propose(ownedAccountID uint64, tx *Tx) error {
 	if err != nil {
 		return err
 	}
-	// thats only delivery reports, not ACK/NACK messages
+
 	resp := p.neighbours.Bcast(context.Background(), prop)
 	for r := range resp {
 		rm, ok := r.(*responseMessage)
@@ -213,6 +209,13 @@ func (p *Process) Propose(ownedAccountID uint64, tx *Tx) error {
 			p.lattice.ack++
 		} else {
 			p.lattice.nack++
+			pv, err:= refine(p.lattice.proposedValue, &rm.Value)
+			if err != nil {
+				p.log.Error("can not update proposed value", zap.Error(err),
+					zap.Uint64("proposal_id", rm.SeqNo))
+
+			}
+			p.lattice.proposedValue = pv
 		}
 		// condition could turns into true before we process all response
 		if p.predicate(ownedAccountID, p.neighbours.N(), p.lattice.ack, p.lattice.nack) {
@@ -234,21 +237,31 @@ func (p *Process) predicate(accountID uint64, N, ack, nack uint64) bool {
 	return true
 }
 
-func (p *Process) Decide(proposerID uint64, proposal *proposal) bool {
+func (p *Process) Accept(proposerID uint64, proposal *proposal) bool {
+	log := p.log.With(
+		zap.Uint64("proposer_id", proposal.SenderPID),
+		zap.Uint64("prop_seq_no", proposal.SeqNo),
+		)
 	if atomic.LoadUint32(&p.status) != StatusAcceptor {
-		panic("Decide call with non-acceptor process status")
+		panic("Accept call with non-acceptor process status")
 		// return false
 	}
-	return p.lattice.Decide(proposerID, p.id, proposal, p.neighbours)
+	log.Debug("deciding on proposal")
+	ok, err :=  p.lattice.Accept(proposerID, p.id, proposal, p.neighbours)
+	if err != nil {
+		log.Debug("decision: nack", zap.Error(err))
+		return ok
+	}
+	log.Debug("decision: ack", zap.Error(err))
+	return ok
 }
 
-// Decide is an Accept func from original GLA
-func (l *Lattice) Decide(proposerID, myPID uint64, proposal *proposal, netw Neighbours) bool {
+// Accept func from original GLA
+func (l *Lattice) Accept(proposerID, myPID uint64, proposal *proposal, netw Neighbours) (bool, error) {
 	if proposal.SeqNo != l.proposalSeqNo {
-		panic(fmt.Errorf(
+		return false, fmt.Errorf(
 			"deciding on proposal_seq_no=%d, proccess current proposal_seq_no=%d",
-			proposal.SeqNo, l.proposalSeqNo))
-		// return false
+			proposal.SeqNo, l.proposalSeqNo)
 	}
 
 	// TODO need to check if we processing currently proposed value
