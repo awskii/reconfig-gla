@@ -22,7 +22,7 @@ func main() {
 
 	for i := 1; i < len(proc)+1; i++ {
 		i64 := uint64(i)
-		l := la.NewLattice(i64, log.With(zap.String("module", "lattice")))
+		l := la.NewAgreement(i64, log.With(zap.String("module", "lattice")))
 
 		for j := 1; j < len(proc)+1; j++ {
 			l.AddAccount(uint64(j))
@@ -70,21 +70,8 @@ func main() {
 			}
 		}
 
-		tx := &la.Tx{
-			Sender:   a,
-			Receiver: b,
-			Amount:   x,
-			SeqID:    proc[a-1].LastSeq(a) + 1,
-		}
-		l = l.With(
-			zap.Uint64("a", a),
-			zap.Uint64("b", b),
-			zap.Uint64("s", tx.SeqID),
-		)
-		l.Info("active proposal")
-
-		if err := proc[a-1].Propose(a, tx); err != nil {
-			l.Error("proposed tx nack", zap.Error(err))
+		if err := proc[a-1].Propose(a, a, b, x); err != nil {
+			l.Sugar().Errorf("proposal rejected receiver=%d round=%d err=%v", a, round, err)
 			continue
 		}
 		l.Info("system progress step")

@@ -10,8 +10,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// neighbours interface needed to separate Lattice model from Broadcast
-// mechanism which Lattice can employ.
+// neighbours interface needed to separate Agreement model from Broadcast
+// mechanism which Agreement can employ.
 type Neighbours interface {
 	N() uint64 // amount of active neighbours
 	Bcast(ctx context.Context, msg Message) chan Message

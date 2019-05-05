@@ -1,14 +1,11 @@
 package la
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"sync"
-	"sync/atomic"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 )
 
 var (
@@ -21,8 +18,9 @@ var (
 	// which violates Validity property
 	ErrNextNotSuperset = errors.New("received element should be superset of previous one")
 	// ErrMergeNegativeBalance means that merge result does not
-	// holds non-negative balance restriction (Validity property)
+	// holds non-negative validate restriction (Validity property)
 	ErrMergeNegativeBalance = errors.New("trying to merge element which leads to balance(a) < 0")
+	ErrNegativeBalance      = errors.New("negative balance")
 )
 
 const (
@@ -34,159 +32,6 @@ const (
 	StatusProposer uint32 = 1
 )
 
-// Lattice should be initalized in every working process
-type Lattice struct {
-	mu       sync.RWMutex
-	accounts map[uint64]*Element // by account ID store their ordered by SeqID transactions.
-	// auxiliary values for GLA
-	activeValue   *Element
-	acceptedValue *Element
-	proposedValue *Element
-	proposalSeqNo uint64
-	outputValue   *Element
-	ack, nack     uint64
-	log           *zap.Logger
-
-	version uint64
-	// currently owned account. Further will be added
-	// account migration among processes, but this variable
-	// will exists anyway to hold 'One process can holds many
-	// accounts, but only one processing at a time'
-	ownedAccount uint64
-}
-
-func NewLattice(owner uint64, log *zap.Logger) *Lattice {
-	return &Lattice{
-		accounts:     make(map[uint64]*Element),
-		ownedAccount: owner,
-		log:          log,
-	}
-}
-
-func (l *Lattice) AddAccount(aid uint64) {
-	// l.log.Debug("add account", zap.Uint64("account_id", aid))
-	l.mu.Lock()
-	l.accounts[aid] = &Element{
-		accountID: aid,
-		T:         []Tx{{Sender: 0, Receiver: aid, Amount: 20, SeqID: 1}},
-	}
-	l.mu.Unlock()
-}
-
-// Accept func from original GLA
-func (l *Lattice) Accept(proposerID, myPID uint64, proposal *proposal, netw Neighbours) (bool, error) {
-	// if proposal.SeqNo != l.proposalSeqNo {
-	// 	return false, fmt.Errorf(
-	// 		"deciding on proposal_seq_no=%d, proccess current proposal_seq_no=%d",
-	// 		proposal.SeqNo, l.proposalSeqNo)
-	// }
-
-	// TODO need to check if we processing currently proposed value
-	msg := &responseMessage{
-		PID:   myPID,
-		SeqNo: proposal.SeqNo,
-		Value: proposal.Value,
-	}
-
-	l.mu.RLock()
-	l.acceptedValue = l.accounts[proposal.Value.accountID]
-	l.mu.RUnlock()
-	l.log.Debug("validating proposal", zap.Uint64("proposal_id", proposal.SeqNo))
-
-	if err := validate(l.ownedAccount, l.acceptedValue, &proposal.Value); err != nil {
-		av, e := refine(l.acceptedValue, &proposal.Value)
-		if e != nil {
-			/* can't merge accepted and proposed value
-			When we can't do it?
-			*/
-			msg.Value = *l.acceptedValue
-			// netw.Bcast(context.Background(), msg)
-			if er := netw.Send(proposerID, msg); er != nil {
-				l.log.Debug("send error", zap.Error(er))
-			}
-			return false, errors.Errorf("refine_err=%v", e)
-		}
-		l.acceptedValue = av
-		msg.Value = *l.acceptedValue
-		// netw.Bcast(context.Background(), msg)
-		if er := netw.Send(proposerID, msg); er != nil {
-			l.log.Debug("send error", zap.Error(er))
-		}
-		return false, errors.Wrap(err, "validation failure")
-	}
-	msg.Ack = true
-
-	var err error
-	l.acceptedValue, err = merge(proposal.Value.accountID, l.acceptedValue, &proposal.Value)
-	if err != nil {
-		msg.Ack = false
-	}
-	l.accounts[proposal.Value.accountID] = l.acceptedValue
-
-	// netw.Bcast(context.Background(), msg)
-	if er := netw.Send(proposerID, msg); er != nil {
-		l.log.Debug("send error", zap.Error(er))
-	}
-	return msg.Ack, nil
-}
-
-// Merge used to merge element e with sub-semi-lattice of an
-// There are some restictions on operation:
-//  - after merging sender account balance should be >= 0
-//  - element e should be a superset of a lattice element at position pos
-//  - ???
-//
-// Merge can return
-//   ErrNonMonotonicSeqID    -- we missed some messages, should we do something here?
-//   ErrNextNotSuperset      -- their miss some messages, should be refined
-//   ErrUnknownAccountID     -- unknown account id
-//   ErrMergeNegativeBalance -- negative account balance after merge
-func (l *Lattice) Merge(accountID uint64, next Element) (version uint64, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	v, ok := l.accounts[accountID] // RACE
-	if !ok {                       // unknown account
-		return l.version, ErrUnknownAccountID
-	}
-
-	joinMaster, err := merge(accountID, v, &next)
-	if err != nil {
-		return l.version, err
-	}
-
-	tx := next.T[len(next.T)-1]
-	newElem := l.accounts[tx.Receiver]
-	seqNo := newElem.T[len(newElem.T)-1].SeqID
-	tx.SeqID = seqNo + 1
-	newElem.T = append(newElem.T, tx)
-
-	// tx.SeqID = .T[len(l.accounts[tx.Receiver].T)-1].SeqID + 1
-	// joinSlave, err := merge(tx.Receiver, l.accounts[tx.Receiver], &tx)
-	// if err != nil {
-	// 	return l.version, err
-	// }
-	l.accounts[accountID] = joinMaster // RACE
-	l.accounts[tx.Receiver] = newElem
-	return l.version, nil
-}
-
-func (l *Lattice) makeProposal(senderPID uint64, tx *Tx) (*proposal, error) {
-	l.proposedValue = l.accounts[tx.Sender]
-	l.proposedValue.T = append(l.proposedValue.T, *tx)
-	l.nextRound()
-
-	return &proposal{
-		SenderPID: senderPID,
-		SeqNo:     l.proposalSeqNo,
-		Value:     *l.proposedValue,
-	}, nil
-}
-
-func (l *Lattice) nextRound() {
-	atomic.AddUint64(&l.proposalSeqNo, 1)
-	l.ack, l.nack = 0, 0
-}
-
 // Element reprsents one lattice element
 type Element struct {
 	accountID uint64 // defines owner of a set T
@@ -197,212 +42,228 @@ type Element struct {
 	//  - Prm, currently deleted processes
 }
 
+// validate fails if there are monotonicity violation
+func (e *Element) validate() (balance uint64, err error) {
+	var (
+		s uint64
+		p uint64
+	)
+
+	for i := 0; i < len(e.T); i++ {
+		if i == 0 {
+			p = e.T[i].SeqNo
+		}
+		if e.T[i].SeqNo != p {
+			fmt.Printf("prev=%d cur=%d v=%+v\n", p, e.T[i].SeqNo, e.T[i])
+			return 0, errors.Errorf("monotonicity violation at %d!%+v", e.accountID, e.T[i])
+		}
+		switch e.accountID {
+		case e.T[i].Receiver:
+			balance += e.T[i].Amount
+		case e.T[i].Sender:
+			s += e.T[i].Amount
+		}
+		p++
+	}
+	if s > balance {
+		return 0, ErrNegativeBalance
+	}
+	return balance - s, nil
+}
+
+func (e *Element) head() *Tx {
+	return &e.T[len(e.T)-1]
+}
+
+// mergeTxx returns diff if exists, nil otherwise (and set merged version as current)
+func (e *Element) mergeTxx(tx []Tx) (diff []Tx, err error) {
+	if diff = e.diff(tx); diff != nil {
+		return diff, errors.Errorf("can not merge: conflict tx %d!%+v", e.accountID, diff)
+	}
+	tmp := Element{
+		T:         append(e.T, tx...),
+		accountID: e.accountID,
+	}
+	if _, err := tmp.validate(); err != nil {
+		return nil, errors.Wrap(err, "can not merge - validation error")
+	}
+	e.T = tmp.T
+	return nil, nil
+}
+
+func (e *Element) diff(their []Tx) []Tx {
+	res := make([]Tx, 0, 4)
+	prev := uint64(0)
+	for _, t := range their {
+		if t.SeqNo >= uint64(len(e.T)) {
+			continue
+		}
+
+		if t.SeqNo-prev != 1 { // monotonicity check
+			res = append(res, e.T[prev+1])
+			continue
+		}
+
+		m := e.T[t.SeqNo]
+		if m.Sender != t.Sender || m.Receiver != t.Receiver || m.Amount != t.Amount {
+			res = append(res, m)
+		}
+		prev = t.SeqNo
+	}
+	if len(res) == 0 {
+		return nil
+	}
+	return res
+}
+
 // Tx represents transaction
 type Tx struct {
 	Sender   uint64 // sender account ID
 	Receiver uint64 // receiver account ID
 	Amount   uint64 // tx amount
-	SeqID    uint64 // tx sequence number for Sender account
+	SeqNo    uint64 // tx sequence number for Sender account
 }
 
-// Message is an interface for anything which could be
-// passed through network among processes
-type Message interface {
-	Bytes() []byte
-	// TODO(awskii): should be extended with crypto signatures
+type PartlyOrderedSet struct {
+	mu    sync.RWMutex
+	s     map[uint64]Element
+	epoch uint64
 }
 
-// Process holds all needed data and states
-// to provide communication with another processes
-// and reach generalized lattice agreement
-type Process struct {
-	id         uint64     // UUID, process identifier (PID)
-	status     uint32     // current process status {Proposer, Acceptor}
-	lattice    *Lattice   // Lattice structure for, implementation of a GLA
-	neighbours Neighbours // map of available servers to P2P communication with
-	proposing  chan struct{}
-	log        *zap.Logger
-	// CurrentQuorumID int -- should be added later. All quorum stuff should be
-	// moved into separated module about Network: P2P state, known active host list,
-	// list of quorums in currently active configuration and other.
-}
-
-func NewProcess(id uint64, l *Lattice, n Neighbours, log *zap.Logger) *Process {
-	log = log.With(zap.Uint64("pid", id), zap.Uint64("owned_account_id", l.ownedAccount))
-	log.Info("process initiated")
-
-	return &Process{
-		id:         id,
-		lattice:    l,
-		neighbours: n,
-		proposing:  make(chan struct{}),
-		log:        log,
+func NewPartlyOrderedSet() *PartlyOrderedSet {
+	return &PartlyOrderedSet{
+		s: make(map[uint64]Element),
 	}
 }
 
-func (p *Process) Accept(proposerID uint64, proposal *proposal) bool {
-	log := p.log.With(
-		zap.Uint64("proposer_id", proposal.SenderPID),
-		zap.Uint64("prop_seq_no", proposal.SeqNo),
-	)
-	if atomic.LoadUint32(&p.status) != StatusAcceptor {
-		// log.Panic("Accept call with non-acceptor process status")
-		return false
-	}
-	ok, err := p.lattice.Accept(proposerID, p.id, proposal, p.neighbours)
-	if err != nil {
-		log.Debug("decision: nack", zap.Error(err))
-		return ok
-	}
-	log.Debug("decision: ack", zap.Error(err))
-	return ok
+// write adds new account to the lattice
+func (ps *PartlyOrderedSet) write(accountID uint64, el Element) {
+	ps.mu.Lock()
+	ps.s[accountID] = el
+	ps.mu.Unlock()
 }
 
-// Propose used for proposing value of p.lattice to all another
-// processed ProposedValue MUST be verified before proposing.
-func (p *Process) Propose(ownedAccountID uint64, tx *Tx) error {
-	// TODO: seems that that check in wrong place in mine algo
-	if atomic.LoadUint64(&p.lattice.proposalSeqNo) != 0 {
-		return errors.New("currently proposing, parallel proposition is restricted")
-	}
-	p.log.Debug("check local_proposal_seq_no OK")
-	if !atomic.CompareAndSwapUint32(&p.status, StatusAcceptor, StatusProposer) {
-		return errors.New("currently proposing, parallel proposition is restricted")
+// ps knows nothing about it's owner, it's a shared knowledge.
+// Payment returns verified proposal based on current POS state,
+// ready to broadcast to another units that value.
+func (ps *PartlyOrderedSet) payment(from, to, amount uint64) ([]Element, error) {
+	// check if 'from' account has enough validate
+	if ps.balance(from) < amount {
+		return nil, ErrMergeNegativeBalance // pffth
 	}
 
-	p.log.Debug("set process_status=proposer OK")
-	p.proposing <- struct{}{} // notify that process starting his proposition
-
-	defer func() {
-		atomic.StoreUint32(&p.status, StatusProposer)
-		p.log.Debug("set process_status=acceptor OK")
-	}()
-	defer func() { p.proposing <- struct{}{} }() // notify that proposing is finished
-
-	// TODO(awskii): process should own that account and quorum should approve it
-	// TODO(awskii): when proposal become more useful, move broadcast into lattice Propose function
-	prop, err := p.lattice.makeProposal(p.id, tx)
-	if err != nil {
-		return err
-	}
-	p.log.Debug("tx wrapped as proposal OK")
-	p.log.Sugar().Debugf("proposed_value %+v", prop.Value.T)
-
-	log := p.log.With(zap.Uint64("proposal_seq_no", prop.SeqNo))
-
-	resp := p.neighbours.Bcast(context.Background(), prop)
-	for r := range resp {
-		rm, ok := r.(*responseMessage)
-		if !ok || rm.SeqNo != prop.SeqNo {
-			continue
-		}
-
-		if rm.Ack {
-			// we could count ack/nack in proposal to get more elegant solution
-			p.lattice.ack++
-		} else {
-			p.lattice.nack++
-			pv, err := refine(p.lattice.proposedValue, &rm.Value)
-			if err != nil {
-				log.Error("can not update proposed value", zap.Error(err))
-				continue
-			}
-			p.lattice.proposedValue = pv
-		}
-		log.Debug("gossip", zap.Uint64("ack", p.lattice.ack),
-			zap.Uint64("nack", p.lattice.nack))
-
-		// condition could turns into true before we process all response
-		if p.predicate(ownedAccountID, p.neighbours.N(), p.lattice.ack, p.lattice.nack) {
-			log.Debug("merge proposal")
-			// true here means quorum accepted that change, apply it to our version
-			p.lattice.Merge(ownedAccountID, prop.Value)
+	// POS should write two new items to itself to finish transfer
+	// and it should be atomic
+	sn := ps.latestSeqNo(from, to)
+	els := make([]Element, len(sn))
+	for i := 0; i < len(els); i++ {
+		els[i] = Element{
+			T: []Tx{{Sender: from, Receiver: to, Amount: amount, SeqNo: sn[i]+1}},
 		}
 	}
-	if p.predicate(ownedAccountID, p.neighbours.N(), p.lattice.ack, p.lattice.nack) {
-		log.Debug("merge proposal")
-		// true here means quorum accepted that change, apply it to our version
-		_, err = p.lattice.Merge(ownedAccountID, prop.Value)
-		log.Error("merging error", zap.Error(err))
-	}
-	log.Debug("proposal has been rejected")
-	return err
+	els[0].accountID = from
+	els[1].accountID = to
+
+	return els[:2], nil
 }
 
-// simple func to easily check if some 'predicate' holds on proposal
-func (p *Process) predicate(accountID uint64, N, ack, nack uint64) bool {
-	p.log.Info("predicate check",
-		zap.Uint64("N", N),
-		zap.Uint64("ack", ack),
-		zap.Uint64("nack", nack),
-		zap.Uint64("quorum", quorum(N, ack, nack)),
-		zap.Bool("status_proposer", atomic.LoadUint32(&p.status) == StatusProposer),
-	)
-
-	if nack > 0 && nack+ack >= quorum(N, ack, nack) && atomic.LoadUint32(&p.status) == StatusProposer {
-		return false
-	}
-	if ack < quorum(N, ack, nack) && atomic.LoadUint32(&p.status) == StatusProposer {
-		return false
-	}
-	return true
-}
-
-func (p *Process) Operate() {
-	// var ack = make([][]uint64, 8)
-	// if m.SenderPID >= uint64(len(ack)){
-	// 	ack = append(ack, make([]uint64, 0))
-	// }
-	// if m.SeqNo >= uint64(len(ack[m.SenderPID])) {
-	// 	ack[m.SenderPID] = append(ack[m.SenderPID],  0)
-	// }
-	// if m.Ack {
-	// 	ack[m.PID][m.SeqNo]++
-	// }
-	for {
-		select {
-		case <-p.proposing:
-			<-p.proposing // waiting till proposing finished
-		case msg := <-p.neighbours.RecvInput(p.id):
-			switch msg.(type) {
-			case *proposal:
-				m, _ := msg.(*proposal)
-				p.Accept(m.SenderPID, m)
-			case *responseMessage:
-				m, _ := msg.(*responseMessage)
-				p.log.Debug("received response", zap.Bool("ack", m.Ack), zap.Uint64("seq_no", m.SeqNo))
-			default:
-				p.log.Debug("received msg of unknown type")
-			}
+func wrapTx(tx []Tx) []Element {
+	e := make(map[uint64]Element, 0)
+	for i := 0; i < len(tx); i++ {
+		v, ok := e[tx[i].Sender]
+		if !ok {
+			v = Element{accountID: tx[i].Sender, T: make([]Tx, 0)}
 		}
+		v.T = append(v.T, tx[i])
 	}
-}
-
-func (p *Process) LastSeq(ownedAccount uint64) uint64 {
-	p.lattice.mu.RLock()
-	v, ok := p.lattice.accounts[ownedAccount]
-	if !ok {
-		p.log.Panic("account didn't initialize his mem", zap.Uint64("owned_account", ownedAccount))
-	}
-	p.lattice.mu.RUnlock()
-	return v.T[len(v.T)-1].SeqID
-}
-
-func (p *Process) Balance(ownedAccount uint64) uint64 {
-	p.lattice.mu.RLock()
-	v := p.lattice.accounts[ownedAccount]
-	p.lattice.mu.RUnlock()
-	var s uint64
-	for _, tx := range v.T {
-		switch ownedAccount {
-		case tx.Sender:
-			s -= tx.Amount
-		case tx.Receiver:
-			s += tx.Amount
-		}
+	s := make([]Element, len(e))
+	i := 0
+	for _, el := range e {
+		s[i] = el
+		i++
 	}
 	return s
 }
+
+func (ps *PartlyOrderedSet) merge(set []Element) ([]Element, error) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	df := make([]Tx, 0)
+	aux := make([]Element, len(set))
+	for i := 0; i < len(set); i++ {
+		// copy current values for accounts in 'set'
+		aux[i] = ps.s[set[i].accountID]
+		diff, err := aux[i].mergeTxx(set[i].T)
+		if err != nil {
+			fmt.Println (err)
+			df = append(df, diff...)
+		}
+	}
+	if len(df) != 0 {
+		return wrapTx(df), errors.New("merge: failed due to conflicts")
+	}
+
+	// validation finished, need to merge to ours
+	for _, el := range aux {
+		ps.s[el.accountID] = el
+	}
+	return nil, nil
+}
+
+func (ps *PartlyOrderedSet) balance(accountID uint64) uint64 {
+	ps.mu.RLock()
+	a, ok := ps.s[accountID]
+	ps.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	if accountID != a.accountID {
+		return 0 // malformed key link
+	}
+	b, err := a.validate()
+	if err != nil {
+		// this error should not occur in operating PartlyOrderedSet
+		// bc we validating all elements during the merge operation
+		panic(err)
+	}
+	return b
+}
+
+// returns list of latest sequence numbers for every account in a
+func (ps *PartlyOrderedSet) latestSeqNo(a ...uint64) []uint64 {
+	v := make([]uint64, len(a))
+	ps.mu.RLock()
+	for i, account := range a {
+		s := ps.s[account]
+		v[i] = (*s.head()).SeqNo
+	}
+	ps.mu.RUnlock()
+	return v
+}
+
+func (ps *PartlyOrderedSet) read(accountID uint64) *Element {
+	ps.mu.RLock()
+	v := ps.s[accountID]
+	ps.mu.RUnlock()
+	return &v
+}
+
+// diff returns ps vision on transaction set, if it differs from provided 'their' version
+// func (ps *PartlyOrderedSet) diff(their *Element) Element {
+// 	if their == nil {
+// 		return nil
+// 	}
+// 	ps.mu.RLock()
+// 	for i := 0; i < len(their) ; i++ {
+// 		if their[i].SeqNo > uint64(len(their) -1) {
+// 			ps.s[their[i].Sender] = ps.
+// 		}
+//
+// 	}
+//
+//
+// }
 
 // ------------------------- Helper functions -----------------------------
 // dist checks distance between next and previous element.
@@ -422,16 +283,16 @@ func dist(prev, next *Element) (int, error) {
 
 	latestPrev, latestNext := prev.T[len(prev.T)-1], next.T[len(next.T)-1]
 	fmt.Printf("lprev=%+v lnext=%+v\n", latestPrev, latestNext)
-	d := latestNext.SeqID - latestPrev.SeqID
+	d := latestNext.SeqNo - latestPrev.SeqNo
 	if d == 0 {
-		panic(fmt.Errorf("ordering violation at seq_no=%d", latestNext.SeqID))
+		panic(fmt.Errorf("ordering violation at seq_no=%d", latestNext.SeqNo))
 	}
 	if err != nil {
 		return int(d), err
 	}
 	if d > 1 {
 		// panic(fmt.Errorf("ordering violation: our seq_no=%d, their seq_no=%d",
-		// 	latestPrev.SeqID, latestNext.SeqID))
+		// 	latestPrev.SeqNo, latestNext.SeqNo))
 		return int(d), ErrNonMonotonicSeqID
 	}
 	if d < 0 {
@@ -443,7 +304,7 @@ func dist(prev, next *Element) (int, error) {
 // validate checks:
 //  - distance between next and previous element
 //  - if next.T is a superset of prev.T
-//  - that merge(prev, next) result has positive balance
+//  - that merge(prev, next) result has positive validate
 func validate(accoountID uint64, prev, next *Element) error {
 	dist, err := dist(prev, next)
 	if err != nil {
@@ -493,16 +354,16 @@ func validate(accoountID uint64, prev, next *Element) error {
 
 func compare(a, b *Tx) error {
 	if a.Sender != b.Sender {
-		return fmt.Errorf("their tx seq_no=%d: invalid Sender", b.SeqID)
+		return fmt.Errorf("their tx seq_no=%d: invalid Sender", b.SeqNo)
 	}
 	if a.Receiver != b.Receiver {
-		return fmt.Errorf("their tx seq_no=%d: invalid Receiver", b.SeqID)
+		return fmt.Errorf("their tx seq_no=%d: invalid Receiver", b.SeqNo)
 	}
 	if a.Amount != b.Amount {
-		return fmt.Errorf("their tx seq_no=%d: invalid Amount", b.SeqID)
+		return fmt.Errorf("their tx seq_no=%d: invalid Amount", b.SeqNo)
 	}
-	if a.SeqID != b.SeqID {
-		return fmt.Errorf("their tx seq_no=%d: invalid SeqID", b.SeqID)
+	if a.SeqNo != b.SeqNo {
+		return fmt.Errorf("their tx seq_no=%d: invalid SeqNo", b.SeqNo)
 	}
 	return nil
 }
@@ -527,14 +388,14 @@ func refine(prev, next *Element) (*Element, error) {
 		T: make([]Tx, dist),
 	}
 
-	for i, j := 0, next.T[len(next.T)-1].SeqID; j < uint64(len(prev.T)); i, j = i+1, j+1 {
+	for i, j := 0, next.T[len(next.T)-1].SeqNo; j < uint64(len(prev.T)); i, j = i+1, j+1 {
 		diff.T[i] = prev.T[j]
 	}
 	return diff, nil
 }
 
 // simple func to easily change quorum conditions
-func quorum(N, ack, nack uint64) uint64 {
+func quorum(N uint64) uint64 {
 	return uint64(math.Floor((float64(N) + 1.0) / 2.0))
 }
 
