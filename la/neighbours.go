@@ -2,7 +2,6 @@ package la
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -18,6 +17,7 @@ type Neighbours interface {
 	Send(receiverPID uint64, msg Message) error
 	RecvInput(host uint64) chan Message
 	Recv(from uint64) chan Message
+	Respond(toHost uint64, msg Message)
 }
 
 // Neigh is a struct to separate all networking and
@@ -90,7 +90,7 @@ type duplex struct {
 
 func (l *Local) AddNew(hostID uint64) {
 	l.mu.Lock()
-	l.hosts[hostID] = duplex{in: make(chan Message, 128), out: make(chan Message, 128)}
+	l.hosts[hostID] = duplex{in: make(chan Message), out: make(chan Message)}
 	l.mu.Unlock()
 }
 
@@ -101,14 +101,11 @@ func (l *Local) N() uint64 {
 }
 
 func (l *Local) Send(hid uint64, msg Message) error {
-	l.mu.RLock()
-	ch := l.hosts[hid]
-	l.mu.RUnlock()
-
-	if ch.in == nil || ch.out == nil {
-		return errors.New("route to host is malformed")
-	}
-	ch.in <- msg
+	// l.mu.Lock()
+	fmt.Printf("[??] net send msg to %d\n", hid)
+	l.hosts[hid].in <- msg
+	fmt.Printf("[ok] net sent msg to %d\n", hid)
+	// l.mu.Unlock()
 	return nil
 }
 
@@ -118,57 +115,25 @@ func (l *Local) Bcast(ctx context.Context, msg Message) chan Message {
 	sink := make(chan Message)
 	var wg sync.WaitGroup
 
-	l.mu.RLock()
-	for _, ch := range l.hosts {
+	// l.mu.RLock()
+	for accID, _ := range l.hosts {
 		wg.Add(1)
+		v := l.hosts[accID]
 
 		go func(ch *duplex, wg *sync.WaitGroup) {
 			defer wg.Done()
 
-			ch.in <-msg
-			resp := <- ch.out
-			sink<-resp
-		}(&ch, &wg)
-		ch.in <- msg
-
-		// wg.Add(1)
-		// // routine waits response from process. Any response from process copied
-		// // to sink from which Sender can read responses. Waiting can be interrupted by context
-		// go func(sink chan<- Message, out <-chan Message, ctx context.Context, wg *sync.WaitGroup) {
-		// 	defer wg.Done()
-		// 	select {
-		// 	case m := <-out:
-		// 		sink <- m
-		// 	case <-ctx.Done():
-		// 		return
-		// 	}
-		// }(sink, ch.out, ctx, &wg)
+			ch.in <- msg
+			resp := <-ch.out
+			sink <- resp
+		}(&v, &wg)
 	}
-	l.mu.RUnlock()
+	// l.mu.RUnlock()
 	l.log.Debug("finished message broadcasting")
 	go func(sink chan Message, wg *sync.WaitGroup) {
-		wg.Done()
+		wg.Wait()
 		close(sink)
 	}(sink, &wg)
-	//
-	//
-	// // routine needed for proper closing of a sink. It closes if all hosts did respond OR if
-	// // ctx has been cancelled, whatever happens first.
-	// go func(sink chan<- Message, ctx context.Context, wg *sync.WaitGroup) {
-	// 	ch := make(chan struct{}, 1)
-	// 	go func() {
-	// 		wg.Wait()
-	// 		ch <- struct{}{}
-	// 	}()
-	//
-	// 	select {
-	// 	case <-ctx.Done():
-	// 		break
-	// 	case <-ch:
-	// 		break
-	// 	}
-	// 	close(sink)
-	// }(sink, ctx, &wg)
 
 	return sink
 }
@@ -182,9 +147,15 @@ func (l *Local) RecvInput(host uint64) chan Message {
 	return c
 }
 
-func (l *Local) Recv(from uint64) chan Message{
+func (l *Local) Respond(toHost uint64, msg Message) {
+	l.mu.Lock()
+	l.hosts[toHost].out <- msg
+	l.mu.Unlock()
+}
+
+func (l *Local) Recv(from uint64) chan Message {
 	l.mu.RLock()
-c:= 	l.hosts[from].out
+	c := l.hosts[from].out
 	l.mu.RUnlock()
-return c
+	return c
 }

@@ -36,6 +36,7 @@ const (
 type Element struct {
 	accountID uint64 // defines owner of a set T
 	T         []Tx   // Holds incoming and outgoing tx's
+	mu        sync.Mutex
 	// Could be extended with Replecated Data Types:
 	//  - u,   ownership function(?) implementation
 	//  - Pa,  currently available processes
@@ -43,18 +44,20 @@ type Element struct {
 }
 
 // validate fails if there are monotonicity violation
+// it' s a caller responsiveness to make it thread safe.
 func (e *Element) validate() (balance uint64, err error) {
 	var (
 		s uint64
 		p uint64
 	)
 
+	fmt.Printf("validate v=%+v\n", e.T)
 	for i := 0; i < len(e.T); i++ {
 		if i == 0 {
 			p = e.T[i].SeqNo
 		}
 		if e.T[i].SeqNo != p {
-			fmt.Printf("prev=%d cur=%d v=%+v\n", p, e.T[i].SeqNo, e.T[i])
+			fmt.Printf("prev=%d cur=%d v=%v\n", p, e.T[i].SeqNo, e.T[i])
 			return 0, errors.Errorf("monotonicity violation at %d!%+v", e.accountID, e.T[i])
 		}
 		switch e.accountID {
@@ -66,27 +69,36 @@ func (e *Element) validate() (balance uint64, err error) {
 		p++
 	}
 	if s > balance {
+		fmt.Printf("%p %+v\n", e, e)
 		return 0, ErrNegativeBalance
 	}
 	return balance - s, nil
 }
 
 func (e *Element) head() *Tx {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return &e.T[len(e.T)-1]
 }
 
 // mergeTxx returns diff if exists, nil otherwise (and set merged version as current)
 func (e *Element) mergeTxx(tx []Tx) (diff []Tx, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if diff = e.diff(tx); diff != nil {
 		return diff, errors.Errorf("can not merge: conflict tx %d!%+v", e.accountID, diff)
 	}
-	tmp := Element{
+
+	tmp := &Element{
 		T:         append(e.T, tx...),
 		accountID: e.accountID,
 	}
 	if _, err := tmp.validate(); err != nil {
 		return nil, errors.Wrap(err, "can not merge - validation error")
 	}
+
+	fmt.Printf("old=%v new=%v\n", e.T, tmp.T)
 	e.T = tmp.T
 	return nil, nil
 }
@@ -126,21 +138,42 @@ type Tx struct {
 
 type PartlyOrderedSet struct {
 	mu    sync.RWMutex
-	s     map[uint64]Element
+	s     map[uint64]*Element
 	epoch uint64
 }
 
 func NewPartlyOrderedSet() *PartlyOrderedSet {
 	return &PartlyOrderedSet{
-		s: make(map[uint64]Element),
+		s: make(map[uint64]*Element),
 	}
+}
+
+func (ps *PartlyOrderedSet) add(accountID uint64) {
+	ps.mu.Lock()
+	ps.s[accountID] = &Element{accountID: accountID, T: make([]Tx, 0)}
+	ps.mu.Unlock()
 }
 
 // write adds new account to the lattice
 func (ps *PartlyOrderedSet) write(accountID uint64, el Element) {
 	ps.mu.Lock()
-	ps.s[accountID] = el
+	ps.s[accountID].mu.Lock()
+	ps.s[accountID].T = append(ps.s[accountID].T, el.T...)
+	ps.s[accountID].mu.Unlock()
 	ps.mu.Unlock()
+}
+
+func (ps *PartlyOrderedSet) copy() *PartlyOrderedSet {
+	ps.mu.Lock()
+	cp := &PartlyOrderedSet{
+		s:     make(map[uint64]*Element),
+		epoch: ps.epoch,
+	}
+	for k, v := range ps.s {
+		cp.s[k] = &Element{accountID: v.accountID, T: v.T}
+	}
+	ps.mu.Unlock()
+	return cp
 }
 
 // ps knows nothing about it's owner, it's a shared knowledge.
@@ -158,7 +191,7 @@ func (ps *PartlyOrderedSet) payment(from, to, amount uint64) ([]Element, error) 
 	els := make([]Element, len(sn))
 	for i := 0; i < len(els); i++ {
 		els[i] = Element{
-			T: []Tx{{Sender: from, Receiver: to, Amount: amount, SeqNo: sn[i]+1}},
+			T: []Tx{{Sender: from, Receiver: to, Amount: amount, SeqNo: sn[i] + 1}},
 		}
 	}
 	els[0].accountID = from
@@ -190,13 +223,15 @@ func (ps *PartlyOrderedSet) merge(set []Element) ([]Element, error) {
 	defer ps.mu.Unlock()
 
 	df := make([]Tx, 0)
-	aux := make([]Element, len(set))
+	aux := make([]*Element, len(set))
 	for i := 0; i < len(set); i++ {
 		// copy current values for accounts in 'set'
-		aux[i] = ps.s[set[i].accountID]
+		v := ps.s[set[i].accountID]
+		aux[i] = &(*v)
+
 		diff, err := aux[i].mergeTxx(set[i].T)
 		if err != nil {
-			fmt.Println (err)
+			fmt.Println(err)
 			df = append(df, diff...)
 		}
 	}
@@ -206,18 +241,16 @@ func (ps *PartlyOrderedSet) merge(set []Element) ([]Element, error) {
 
 	// validation finished, need to merge to ours
 	for _, el := range aux {
-		ps.s[el.accountID] = el
+		ps.s[el.accountID].T = el.T
+		/*		ps.s[el.accountID].mu.Lock()
+		ps.s[el.accountID].T = append(ps.s[el.accountID].T, el.T...)
+		ps.s[el.accountID].mu.Unlock()*/
 	}
 	return nil, nil
 }
 
 func (ps *PartlyOrderedSet) balance(accountID uint64) uint64 {
-	ps.mu.RLock()
-	a, ok := ps.s[accountID]
-	ps.mu.RUnlock()
-	if !ok {
-		return 0
-	}
+	a := ps.read(accountID)
 	if accountID != a.accountID {
 		return 0 // malformed key link
 	}
@@ -242,11 +275,11 @@ func (ps *PartlyOrderedSet) latestSeqNo(a ...uint64) []uint64 {
 	return v
 }
 
-func (ps *PartlyOrderedSet) read(accountID uint64) *Element {
+func (ps *PartlyOrderedSet) read(accountID uint64) Element {
 	ps.mu.RLock()
 	v := ps.s[accountID]
 	ps.mu.RUnlock()
-	return &v
+	return *v
 }
 
 // diff returns ps vision on transaction set, if it differs from provided 'their' version

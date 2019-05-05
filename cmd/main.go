@@ -46,7 +46,7 @@ func main() {
 
 	round := 0
 	x := uint64(1)
-	for range time.Tick(time.Second * 5) {
+	for range time.Tick(time.Second * 2) {
 		round++
 		l := log.With(zap.Int("round", round))
 

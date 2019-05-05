@@ -17,6 +17,7 @@ type Process struct {
 	neighbours Neighbours // map of available servers to P2P communication with
 	proposing  chan struct{}
 	log        *zap.Logger
+	bcastresp chan response
 	// CurrentQuorumID int -- should be added later. All quorum stuff should be
 	// moved into separated module about Network: P2P state, known active host list,
 	// list of quorums in currently active configuration and other.
@@ -31,6 +32,7 @@ func NewProcess(id uint64, l *Agreement, n Neighbours, log *zap.Logger) *Process
 		lattice:    l,
 		neighbours: n,
 		proposing:  make(chan struct{}),
+		bcastresp: make(chan response),
 		log:        log,
 	}
 }
@@ -75,12 +77,12 @@ func (p *Process) Propose(ownedAccountID, a, b, x uint64) error {
 		return err
 	}
 	p.log.Sugar().Debugf("proposal %+v", prop)
-	return p.lattice.Propose(p.id, p.predicate, p.neighbours)
+	return p.lattice.Propose(p.id, p.predicate, p.neighbours, p.bcastresp)
 }
 
 // simple func to easily check if some 'predicate' holds on proposal
 func (p *Process) predicate(N, ack, nack uint64) bool {
-	p.log.Info("predicate check",
+	p.log.Debug("predicate check",
 		zap.Uint64("N", N),
 		zap.Uint64("ack", ack),
 		zap.Uint64("nack", nack),
@@ -113,6 +115,7 @@ func (p *Process) Operate() {
 			case *response:
 				m, _ := msg.(*response)
 				p.log.Debug("received response", zap.Bool("ack", m.Ack), zap.Uint64("seq_no", m.SeqNo))
+				p.bcastresp <- *m
 			default:
 				p.log.Debug("received msg of unknown type")
 			}

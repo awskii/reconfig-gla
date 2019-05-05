@@ -36,21 +36,23 @@ type Agreement struct {
 func NewAgreement(owner uint64, log *zap.Logger) *Agreement {
 	return &Agreement{
 		v:   NewPartlyOrderedSet(),
-		log: log,
+		log: log.With(zap.Uint64("pid", owner)),
 
 		ownedAccount: owner,
 	}
 }
 
 func (ag *Agreement) AddAccount(aid uint64) {
-	ag.v.write(aid, Element{aid, []Tx{{Sender:0, Receiver:aid, Amount:20, SeqNo:1}}})
+	ag.v.add(aid)
+	ag.v.write(aid, Element{
+		accountID: aid, T: []Tx{{Sender: 0, Receiver: aid, Amount: 20, SeqNo: 1}}})
 }
 
 // Accept func from original GLA
 func (ag *Agreement) Accept(proposerID, myPID uint64, proposal *proposal, netw Neighbours) (bool, error) {
 	cp := atomic.LoadUint64(&ag.proposalSeqNo)
 	if proposal.SeqNo != cp {
-		return false, fmt.Errorf("current proposal seq_no=%d provided seq_no=%d",cp, proposal.SeqNo)
+		return false, fmt.Errorf("current proposal seq_no=%d provided seq_no=%d", cp, proposal.SeqNo)
 	}
 
 	// TODO need to check if we processing currently proposed value
@@ -70,26 +72,24 @@ func (ag *Agreement) Accept(proposerID, myPID uint64, proposal *proposal, netw N
 	if err != nil {
 		ag.log.Sugar().Debugf("can not accept err=%v diff=%+v", err, diff)
 		msg.Value = diff
-		if er := netw.Send(proposerID, msg); er != nil {
-			ag.log.Debug("send error", zap.Error(er))
-		}
+		ag.log.Debug("sending NACK", zap.Uint64("proposal_id", proposal.SeqNo))
+
+		netw.Respond(myPID, msg)
 		return false, err
 	}
 	msg.Ack = true
-	if er := netw.Send(proposerID, msg); er != nil {
-		ag.log.Debug("send error", zap.Error(er))
-	}
+	ag.log.Debug("sending ACK", zap.Uint64("proposal_id", proposal.SeqNo))
+	netw.Respond(myPID, msg)
 	return msg.Ack, nil
 }
 
-func (ag *Agreement) Propose(myPID uint64, predicate Predicate, netw Neighbours) error {
+func (ag *Agreement) Propose(myPID uint64, predicate Predicate, netw Neighbours, resp chan response) error {
 	// TODO: seems that that check in wrong place in mine algo
 	if atomic.LoadUint64(&ag.proposalSeqNo) != 0 {
 		return errors.New("currently proposing, parallel proposition is restricted")
 	}
-	log := ag.log.With(zap.Uint64("proposal_seq_no", ag.curProposal.SeqNo))
 
-	ag.proposedValue = ag.v
+	ag.proposedValue = ag.v.copy()
 	_, err := ag.proposedValue.merge(ag.curProposal.Value)
 	if err != nil {
 		return errors.Wrap(err, "propose")
@@ -97,13 +97,16 @@ func (ag *Agreement) Propose(myPID uint64, predicate Predicate, netw Neighbours)
 
 rePropose:
 	N := netw.N()
-	ag.nextRound()
 	ctx, cancelBcast := context.WithCancel(context.Background())
+	log := ag.log.With(zap.Uint64("proposal_seq_no", ag.curProposal.SeqNo))
 
-	resp := netw.Bcast(ctx, ag.curProposal)
-	for r := range resp {
+	respp := netw.Bcast(ctx, ag.curProposal)
+	for r := range respp {
 		rm, ok := r.(*response)
 		if !ok || rm.SeqNo != ag.curProposal.SeqNo {
+			continue
+		}
+		if rm.SeqNo != ag.curProposal.SeqNo {
 			continue
 		}
 
@@ -119,6 +122,7 @@ rePropose:
 			}
 			// TODO FILL PROPOSAL VALUE
 			cancelBcast()
+			ag.nextRound()
 			goto rePropose
 		}
 		ag.log.Debug("gossip", zap.Uint64("ack", ag.ack), zap.Uint64("nack", ag.nack))
@@ -152,7 +156,7 @@ func (ag *Agreement) makeProposal(senderPID, a, b, x uint64) (*proposal, error) 
 		SeqNo:     ag.proposalSeqNo,
 	}
 
-	value, err := ag.v.payment(a, b ,x)
+	value, err := ag.v.payment(a, b, x)
 	if err != nil {
 		return nil, err
 	}
@@ -162,5 +166,6 @@ func (ag *Agreement) makeProposal(senderPID, a, b, x uint64) (*proposal, error) 
 
 func (ag *Agreement) nextRound() {
 	atomic.AddUint64(&ag.proposalSeqNo, 1)
+	atomic.AddUint64(&ag.curProposal.SeqNo, 1)
 	ag.ack, ag.nack = 0, 0
 }
